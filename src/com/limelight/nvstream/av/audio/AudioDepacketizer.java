@@ -8,7 +8,7 @@ import com.limelight.nvstream.av.SequenceHelper;
 
 public class AudioDepacketizer {
 	
-	private static final int DU_LIMIT = 30;
+	private static final int DU_LIMIT = 5;
 	private PopulatedBufferList<ByteBufferDescriptor> decodedUnits;
 	
 	// Direct submit state

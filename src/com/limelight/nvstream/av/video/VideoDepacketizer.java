@@ -31,7 +31,7 @@ public class VideoDepacketizer {
 	private ConnectionStatusListener controlListener;
 	private final int nominalPacketDataLength;
 	
-	private static final int DU_LIMIT = 15;
+	private static final int DU_LIMIT = 5;
 	private PopulatedBufferList<DecodeUnit> decodedUnits;
 	
 	public VideoDepacketizer(ConnectionStatusListener controlListener, int nominalPacketSize)
