@@ -1,5 +1,6 @@
 package com.limelight.nvstream.av.video;
 
+import java.util.HashSet;
 import java.util.LinkedList;
 
 import com.limelight.LimeLog;
@@ -14,6 +15,7 @@ public class VideoDepacketizer {
 	// Current frame state
 	private LinkedList<ByteBufferDescriptor> avcFrameDataChain = null;
 	private int avcFrameDataLength = 0;
+	private HashSet<VideoPacket> packetSet = null;
 	
 	// Sequencing state
 	private int lastPacketInStream = 0;
@@ -31,6 +33,9 @@ public class VideoDepacketizer {
 	private ConnectionStatusListener controlListener;
 	private final int nominalPacketDataLength;
 	
+	private static final int CONSECUTIVE_DROP_LIMIT = 120;
+	private int consecutiveFrameDrops = 0;
+	
 	private static final int DU_LIMIT = 15;
 	private PopulatedBufferList<DecodeUnit> decodedUnits;
 	
@@ -43,17 +48,50 @@ public class VideoDepacketizer {
 			public Object createFreeBuffer() {
 				return new DecodeUnit();
 			}
+
+			public void cleanupObject(Object o) {
+				DecodeUnit du = (DecodeUnit) o;
+				
+				// Disassociate video packets from this DU
+				for (VideoPacket pkt : du.getBackingPackets()) {
+					pkt.decodeUnitRefCount.decrementAndGet();
+				}
+				du.clearBackingPackets();
+			}
 		});
 	}
 	
 	private void dropAvcFrameState()
 	{
 		waitingForIdrFrame = true;
+		
+		// Count the number of consecutive frames dropped
+		consecutiveFrameDrops++;
+		
+		// If we reach our limit, immediately request an IDR frame
+		// and reset
+		if (consecutiveFrameDrops == CONSECUTIVE_DROP_LIMIT) {
+			LimeLog.warning("Reached consecutive drop limit");
+			
+			// Restart the count
+			consecutiveFrameDrops = 0;
+			
+			// Request an IDR frame
+			controlListener.connectionDetectedFrameLoss(0, 0);
+		}
+		
 		cleanupAvcFrameState();
 	}
 	
 	private void cleanupAvcFrameState()
 	{
+		if (packetSet != null) {
+			for (VideoPacket pkt : packetSet) {
+				pkt.decodeUnitRefCount.decrementAndGet();
+			}
+			packetSet = null;
+		}
+		
 		avcFrameDataChain = null;
 		avcFrameDataLength = 0;
 	}
@@ -95,7 +133,10 @@ public class VideoDepacketizer {
 			
 			// Initialize the free DU
 			du.initialize(DecodeUnit.TYPE_H264, avcFrameDataChain,
-					avcFrameDataLength, frameNumber, frameStartTime, flags);
+					avcFrameDataLength, frameNumber, frameStartTime, flags, packetSet);
+			
+			// Packets now owned by the DU
+			packetSet = null;
 			
 			controlListener.connectionReceivedFrame(frameNumber);
 			
@@ -104,6 +145,9 @@ public class VideoDepacketizer {
 
 			// Clear old state
 			cleanupAvcFrameState();
+			
+			// Clear frame drops
+			consecutiveFrameDrops = 0;
 		}
 	}
 	
@@ -136,6 +180,7 @@ public class VideoDepacketizer {
 						// Setup state for the new NAL
 						avcFrameDataChain = new LinkedList<ByteBufferDescriptor>();
 						avcFrameDataLength = 0;
+						packetSet = new HashSet<VideoPacket>();
 						
 						if (cachedSpecialDesc.data[cachedSpecialDesc.offset+cachedSpecialDesc.length] == 0x65) {
 							// This is the NALU code for I-frame data
@@ -190,6 +235,10 @@ public class VideoDepacketizer {
 			if (isDecodingH264 && avcFrameDataChain != null)
 			{
 				ByteBufferDescriptor data = new ByteBufferDescriptor(location.data, start, location.offset-start);
+				
+				if (packetSet.add(packet)) {
+					packet.decodeUnitRefCount.incrementAndGet();
+				}
 
 				// Add a buffer descriptor describing the NAL data in this packet
 				avcFrameDataChain.add(data);
@@ -205,11 +254,17 @@ public class VideoDepacketizer {
 			frameStartTime = System.currentTimeMillis();
 			avcFrameDataChain = new LinkedList<ByteBufferDescriptor>();
 			avcFrameDataLength = 0;
+			packetSet = new HashSet<VideoPacket>();
 		}
 		
 		// Add the payload data to the chain
 		avcFrameDataChain.add(new ByteBufferDescriptor(location));
 		avcFrameDataLength += location.length;
+		
+		// The receive thread can't use this until we're done with it
+		if (packetSet.add(packet)) {
+			packet.decodeUnitRefCount.incrementAndGet();
+		}
 	}
 	
 	private static boolean isFirstPacket(int flags) {
@@ -327,11 +382,14 @@ public class VideoDepacketizer {
 				&& NAL.isAvcFrameStart(cachedSpecialDesc)
 				&& cachedSpecialDesc.data[cachedSpecialDesc.offset+cachedSpecialDesc.length] == 0x67)
 		{
+			// The slow path doesn't update the frame start time by itself
+			frameStartTime = System.currentTimeMillis();
+			
 			// SPS and PPS prefix is padded between NALs, so we must decode it with the slow path
 			addInputDataSlow(packet, cachedReassemblyDesc);
 		}
 		else
-		{	
+		{
 			// Everything else can take the fast path
 			addInputDataFast(packet, cachedReassemblyDesc, firstPacket);
 		}
@@ -374,7 +432,7 @@ public class VideoDepacketizer {
 	}
 	
 	public void freeDecodeUnit(DecodeUnit du)
-	{
+	{	
 		decodedUnits.freePopulatedObject(du);
 	}
 }

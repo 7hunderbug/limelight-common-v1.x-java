@@ -3,6 +3,8 @@ package com.limelight.nvstream.input;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
+import com.limelight.utils.Vector2d;
+
 public class ControllerPacket extends InputPacket {
 		public static final byte[] HEADER =
 			{
@@ -46,13 +48,20 @@ public class ControllerPacket extends InputPacket {
 		public static final short PACKET_LENGTH = PAYLOAD_LENGTH +
 				InputPacket.HEADER_LENGTH;
 		
-		private short buttonFlags;
-		private byte leftTrigger;
-		private byte rightTrigger;
-		private short leftStickX;
-		private short leftStickY;
-		private short rightStickX;
-		private short rightStickY;
+		// This is the highest value that is read as zero on the PC
+		public static final short MIN_MAGNITUDE = 7000;
+		
+		// Set this flag if you want ControllerPacket to handle scaling for you
+		// Note: You MUST properly handle deadzones to use this flag
+		public static boolean enableAxisScaling = false;
+		
+		short buttonFlags;
+		byte leftTrigger;
+		byte rightTrigger;
+		short leftStickX;
+		short leftStickY;
+		short rightStickX;
+		short rightStickY;
 		
 		public ControllerPacket(short buttonFlags, byte leftTrigger, byte rightTrigger,
 				 short leftStickX, short leftStickY,
@@ -63,17 +72,52 @@ public class ControllerPacket extends InputPacket {
 			this.buttonFlags = buttonFlags;
 			this.leftTrigger = leftTrigger;
 			this.rightTrigger = rightTrigger;
-			this.leftStickX = leftStickX;
-			this.leftStickY = leftStickY;
-			this.rightStickX = rightStickX;
-			this.rightStickY = rightStickY;
+			
+			Vector2d leftStick = handleDeadZone(leftStickX, leftStickY);
+			this.leftStickX = (short) leftStick.getX();
+			this.leftStickY = (short) leftStick.getY();
+			
+			Vector2d rightStick = handleDeadZone(rightStickX, rightStickY);
+			this.rightStickX = (short) rightStick.getX();
+			this.rightStickY = (short) rightStick.getY();
 		}
 		
-		public byte[] toWire()
-		{
-			ByteBuffer bb = ByteBuffer.allocate(PACKET_LENGTH).order(ByteOrder.LITTLE_ENDIAN);
+		private static Vector2d inputVector = new Vector2d();
+		private static Vector2d normalizedInputVector = new Vector2d();
+		
+		// This function is NOT THREAD SAFE!
+		private static Vector2d handleDeadZone(short x, short y) {
+			// Get out fast if we're in the dead zone
+			if (x == 0 && y == 0) {
+				return Vector2d.ZERO;
+			}
 			
-			bb.put(toWireHeader());
+			// Reinitialize our cached Vector2d object
+			inputVector.initialize(x, y);
+			
+			if (enableAxisScaling) {
+				// Remember our original magnitude for scaling later
+				double magnitude = inputVector.getMagnitude();
+				
+				// Scale to hit a minimum magnitude
+				inputVector.getNormalized(normalizedInputVector);
+				
+				normalizedInputVector.setX(normalizedInputVector.getX() * MIN_MAGNITUDE);
+				normalizedInputVector.setY(normalizedInputVector.getY() * MIN_MAGNITUDE);
+				
+				// Now scale the rest of the way
+				normalizedInputVector.scalarMultiply((32766.0 / MIN_MAGNITUDE) / (32768.0 / magnitude));
+				
+				return normalizedInputVector;
+			}
+			else {
+				return inputVector;
+			}
+		}
+
+		@Override
+		public void toWirePayload(ByteBuffer bb) {
+			bb.order(ByteOrder.LITTLE_ENDIAN);
 			bb.put(HEADER);
 			bb.putShort(buttonFlags);
 			bb.put(leftTrigger);
@@ -83,7 +127,10 @@ public class ControllerPacket extends InputPacket {
 			bb.putShort(rightStickX);
 			bb.putShort(rightStickY);
 			bb.put(TAIL);
-			
-			return bb.array();
+		}
+		
+		@Override
+		public int getPacketLength() {
+			return PACKET_LENGTH;
 		}
 	}

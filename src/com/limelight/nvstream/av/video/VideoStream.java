@@ -1,7 +1,6 @@
 package com.limelight.nvstream.av.video;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -10,6 +9,7 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.util.LinkedList;
 
+import com.limelight.LimeLog;
 import com.limelight.nvstream.NvConnectionListener;
 import com.limelight.nvstream.StreamConfiguration;
 import com.limelight.nvstream.av.ConnectionStatusListener;
@@ -19,10 +19,14 @@ import com.limelight.nvstream.av.RtpReorderQueue;
 public class VideoStream {
 	public static final int RTP_PORT = 47998;
 	public static final int RTCP_PORT = 47999;
-	public static final int FIRST_FRAME_PORT = 47996;
 	
 	public static final int FIRST_FRAME_TIMEOUT = 5000;
 	public static final int RTP_RECV_BUFFER = 64 * 1024;
+	
+	// We can't request an IDR frame until the depacketizer knows
+	// that a packet was lost. This timeout bounds the time that
+	// the RTP queue will wait for missing/reordered packets.
+	public static final int MAX_RTP_QUEUE_DELAY_MS = 10;
 	
 	// The ring size MUST be greater than or equal to
 	// the maximum number of packets in a fully
@@ -83,66 +87,46 @@ public class VideoStream {
 			} catch (InterruptedException e) { }
 		}
 		
-		if (startedRendering) {
-			decRend.stop();
-		}
-		
 		if (decRend != null) {
+			if (startedRendering) {
+				decRend.stop();
+			}
+			
 			decRend.release();
 		}
 		
 		threads.clear();
 	}
-
-	private void readFirstFrame() throws IOException
-	{
-		byte[] firstFrame = new byte[streamConfig.getMaxPacketSize()];
-		
-		firstFrameSocket = new Socket();
-		firstFrameSocket.setSoTimeout(FIRST_FRAME_TIMEOUT);
-		
-		try {
-			firstFrameSocket.connect(new InetSocketAddress(host, FIRST_FRAME_PORT), FIRST_FRAME_TIMEOUT);
-			InputStream firstFrameStream = firstFrameSocket.getInputStream();
-			
-			int offset = 0;
-			for (;;)
-			{
-				int bytesRead = firstFrameStream.read(firstFrame, offset, firstFrame.length-offset);
-				
-				if (bytesRead == -1)
-					break;
-				
-				offset += bytesRead;
-			}
-			
-			VideoPacket packet = new VideoPacket(firstFrame);
-			packet.initializeWithLengthNoRtpHeader(offset);
-			depacketizer.addInputData(packet);
-		} finally {
-			firstFrameSocket.close();
-			firstFrameSocket = null;
-		}
-	}
 	
 	public void setupRtpSession() throws SocketException
 	{
-		rtp = new DatagramSocket(null);
-		rtp.setReuseAddress(true);
+		rtp = new DatagramSocket();
 		rtp.setReceiveBufferSize(RTP_RECV_BUFFER);
-		rtp.bind(new InetSocketAddress(RTP_PORT));
 	}
 	
 	public boolean setupDecoderRenderer(VideoDecoderRenderer decRend, Object renderTarget, int drFlags) {
 		this.decRend = decRend;
+		
+		depacketizer = new VideoDepacketizer(avConnListener, streamConfig.getMaxPacketSize());
+		
 		if (decRend != null) {
-			if (!decRend.setup(streamConfig.getWidth(), streamConfig.getHeight(),
-					60, renderTarget, drFlags)) {
+			try {
+				if (!decRend.setup(streamConfig.getWidth(), streamConfig.getHeight(),
+						60, renderTarget, drFlags)) {
+					return false;
+				}
+				
+				if (!decRend.start(depacketizer)) {
+					abort();
+					return false;
+				}
+				
+				startedRendering = true;
+			} catch (Exception e) {
+				e.printStackTrace();
 				return false;
 			}
 		}
-		
-		depacketizer = new VideoDepacketizer(avConnListener, streamConfig.getMaxPacketSize());
 		
 		return true;
 	}
@@ -152,35 +136,21 @@ public class VideoStream {
 		// Setup the decoder and renderer
 		if (!setupDecoderRenderer(decRend, renderTarget, drFlags)) {
 			// Nothing to cleanup here
-			return false;
+			throw new IOException("Video decoder failed to initialize. Please restart your device and try again.");
 		}
 		
 		// Open RTP sockets and start session
 		setupRtpSession();
 		
-		// Start pinging before reading the first frame
-		// so Shield Proxy knows we're here and sends us
-		// the reference frame
-		startUdpPingThread();
-		
-		// Read the first frame to start the UDP video stream
-		// This MUST be called before the normal UDP receive thread
-		// starts in order to avoid state corruption caused by two
-		// threads simultaneously adding input data.
-		readFirstFrame();
-		
 		if (decRend != null) {
 			// Start the receive thread early to avoid missing
-			// early packets
+			// early packets that are part of the IDR frame
 			startReceiveThread();
-			
-			// Start the renderer
-			if (!decRend.start(depacketizer)) {
-				abort();
-				return false;
-			}
-			startedRendering = true;
 		}
+		
+		// Start pinging before reading the first frame
+		// so GFE knows where to send UDP data
+		startUdpPingThread();
 		
 		return true;
 	}
@@ -194,7 +164,7 @@ public class VideoStream {
 				VideoPacket ring[] = new VideoPacket[VIDEO_RING_SIZE];
 				VideoPacket queuedPacket;
 				int ringIndex = 0;
-				RtpReorderQueue rtpQueue = new RtpReorderQueue();
+				RtpReorderQueue rtpQueue = new RtpReorderQueue(16, MAX_RTP_QUEUE_DELAY_MS);
 				RtpReorderQueue.RtpQueueStatus queueStatus;
 				
 				// Preinitialize the ring buffer
@@ -205,6 +175,7 @@ public class VideoStream {
 
 				byte[] buffer;
 				DatagramPacket packet = new DatagramPacket(new byte[1], 1); // Placeholder array
+				int iterationStart;
 				while (!isInterrupted())
 				{
 					try {
@@ -229,9 +200,20 @@ public class VideoStream {
 								depacketizer.addInputData(queuedPacket);
 							}
 						}
-						
-						// The ring is large enough to account for the maximum queued packets
-						ringIndex = (ringIndex + 1) % VIDEO_RING_SIZE;
+
+						// Go to the next free element in the ring
+						iterationStart = ringIndex; 
+						do {
+							ringIndex = (ringIndex + 1) % VIDEO_RING_SIZE;
+							if (ringIndex == iterationStart) {								
+								// Reinitialize the video ring since they're all being used
+								LimeLog.warning("Packet ring wrapped around!");
+								for (int i = 0; i < VIDEO_RING_SIZE; i++) {
+									ring[i] = new VideoPacket(new byte[requiredBufferSize]);
+								}
+								break;
+							}
+						} while (ring[ringIndex].decodeUnitRefCount.get() != 0);
 					} catch (IOException e) {
 						listener.connectionTerminated(e);
 						return;
@@ -241,7 +223,7 @@ public class VideoStream {
 		};
 		threads.add(t);
 		t.setName("Video - Receive");
-		t.setPriority(Thread.MAX_PRIORITY);
+		t.setPriority(Thread.MAX_PRIORITY - 1);
 		t.start();
 	}
 	
@@ -256,7 +238,7 @@ public class VideoStream {
 				DatagramPacket pingPacket = new DatagramPacket(pingPacketData, pingPacketData.length);
 				pingPacket.setSocketAddress(new InetSocketAddress(host, RTP_PORT));
 				
-				// Send PING every 100 ms
+				// Send PING every 500 ms
 				while (!isInterrupted())
 				{
 					try {
@@ -267,7 +249,7 @@ public class VideoStream {
 					}
 					
 					try {
-						Thread.sleep(100);
+						Thread.sleep(500);
 					} catch (InterruptedException e) {
 						listener.connectionTerminated(e);
 						return;

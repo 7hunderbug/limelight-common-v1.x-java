@@ -12,15 +12,21 @@ public abstract class InputPacket {
 	{
 		this.packetType = packetType;
 	}
+		
+	public abstract void toWirePayload(ByteBuffer bb);
 	
-	public abstract byte[] toWire();
+	public abstract int getPacketLength();
 	
-	public byte[] toWireHeader()
+	public void toWireHeader(ByteBuffer bb)
 	{
-		ByteBuffer bb = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
-		
+		bb.order(ByteOrder.BIG_ENDIAN);
 		bb.putInt(packetType);
-		
-		return bb.array();
+	}
+	
+	public void toWire(ByteBuffer bb)
+	{
+		bb.rewind();
+		toWireHeader(bb);
+		toWirePayload(bb);
 	}
 }
